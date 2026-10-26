@@ -97,6 +97,29 @@ interface Room extends RoomInfo {
   legs: Map<string, Participant>;
 }
 
+/** A phone being rung into a room: where it goes and what it hears on picking up. */
+interface Dialled {
+  code: string;
+  prompt?: string;
+  welcome?: string;
+}
+
+/** The room a dialled leg's client_state names, or null when the call is not one `dial` placed. */
+function dialState(raw: unknown): Dialled | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const s = JSON.parse(Buffer.from(raw, "base64").toString("utf8")) as Record<string, unknown>;
+    if (s["gc"] !== "dial" || typeof s["code"] !== "string" || !/^\d+$/.test(s["code"])) return null;
+    return {
+      code: s["code"],
+      ...(typeof s["prompt"] === "string" ? { prompt: s["prompt"] } : {}),
+      ...(typeof s["welcome"] === "string" ? { welcome: s["welcome"] } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Sending a text. Injected because the number that sends is not always the one called. */
 export interface Sms {
   send(to: string, text: string): Promise<boolean>;
@@ -302,6 +325,8 @@ export class GroupCall {
   protected readonly legFrom = new Map<string, string>();
   /** Legs answering a question an `onCode` hook asked, and what to do with the answer. */
   private readonly pendingGather = new Map<string, (digits: string) => Promise<void>>();
+  /** Phones `dial` is ringing, and the room each is wanted in, until they pick up. */
+  private readonly dialled = new Map<string, Dialled>();
   /** How many times each leg has been asked for a code, so it is not forever. */
   private readonly asks = new Map<string, number>();
   /** Legs whose voice failed once, which hear the plain one from then on. */
@@ -417,8 +442,13 @@ export class GroupCall {
     }
 
     if (type === "call.answered") {
-      // An answered outbound leg is somebody else's business.
-      if (payload["direction"] === "outgoing") return;
+      // An answered outbound leg is somebody else's business, unless it is one
+      // `dial` rang: then it is a person picking up, to be asked in.
+      if (payload["direction"] === "outgoing") {
+        const dialled = this.dialled.get(leg) ?? dialState(payload["client_state"]);
+        if (dialled) await this.offer(leg, dialled);
+        return;
+      }
       await this.ask(leg);
       return;
     }
@@ -474,11 +504,56 @@ export class GroupCall {
     if (type === "conference.participant.left" || type === "call.hangup") {
       this.release(leg);
       this.legFrom.delete(leg);
+      this.dialled.delete(leg);
       this.pendingGather.delete(leg);
       this.asks.delete(leg);
       this.plainVoice.delete(leg);
       return;
     }
+  }
+
+  /**
+   * Ring a phone and bring whoever answers into the room on `code`, so a person
+   * can be called in rather than having to dial in.
+   *
+   * The call goes out on `connectionId` (the call-control app whose webhooks
+   * reach this instance) from `from`, best the room's own dial-in number, so a
+   * missed call rings back into the line. Whoever picks up is asked to press 1
+   * before joining: a voicemail greeting or a wrong number never lands in the
+   * room. The room is carried in the call's client_state too, so an answer
+   * that arrives after a restart still knows where it was going. Returns the
+   * new leg, or null when Telnyx would not place the call.
+   */
+  async dial(code: string, to: string, opts: { from: string; connectionId: string; name?: string; prompt?: string; welcome?: string; timeoutSecs?: number }): Promise<{ leg: string } | null> {
+    const number = normalNumber(to);
+    if (!number || !opts.connectionId || !opts.from) return null;
+    const state: Dialled = { code, ...(opts.prompt ? { prompt: opts.prompt.slice(0, 300) } : {}), ...(opts.welcome ? { welcome: opts.welcome.slice(0, 200) } : {}) };
+    const placed = (await this.request("/calls", {
+      connection_id: opts.connectionId,
+      to: number,
+      from: normalNumber(opts.from),
+      timeout_secs: opts.timeoutSecs ?? 30,
+      client_state: Buffer.from(JSON.stringify({ gc: "dial", ...state }), "utf8").toString("base64"),
+    })) as { data?: { call_control_id?: string } } | null;
+    const leg = placed?.data?.call_control_id;
+    if (typeof leg !== "string") return null;
+    this.dialled.set(leg, state);
+    this.legFrom.set(leg, number);
+    if (opts.name) this.expect(code, number, opts.name, 5 * 60 * 1000);
+    this.options.onEvent?.(`  ringing a phone into a room.`);
+    return { leg };
+  }
+
+  /** A dialled phone was picked up: press 1 to join, so voicemail never does. */
+  private async offer(leg: string, dialled: Dialled, tries = 1): Promise<void> {
+    this.dialled.delete(leg);
+    const prompt = dialled.prompt ?? "This is group call, calling you into a room.";
+    await this.gather(leg, `${tries > 1 ? "" : `${prompt} `}Press 1 to join.`, { validDigits: "0123456789", maximumDigits: 1, timeoutMillis: 10000 }, async (digits) => {
+      if (digits === "1") return this.join(leg, dialled.code, dialled.welcome);
+      if (tries < 2) return this.offer(leg, dialled, tries + 1);
+      await this.command(leg, "speak", { payload: "Okay, not joining. Goodbye.", ...this.voiceBody(leg) });
+      await this.command(leg, "hangup", {});
+    });
   }
 
   /** Hand a well-formed code to the app, and act on what it says the code is. */

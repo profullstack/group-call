@@ -668,3 +668,61 @@ test("a new process restores saved rooms that are still running, names and all, 
   await call.handle({ event_type: "call.transcription", payload: { call_control_id: "leg-a", transcription_data: { transcript: "still here", is_final: true } } });
   assert.deepEqual(lines, ["riotcoder: still here"]);
 });
+
+test("dial rings a phone from the room's number, and the answer is asked to press 1 before it joins", async () => {
+  const { calls, fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "out-1" } } } : conferenceReplies()(path)));
+  const party = line(fetch);
+  const placed = await party.dial("482913", "(408) 555-0101", { from: "+15106169327", connectionId: "conn-1", name: "Anthony", prompt: "Calling you into Standup." });
+  assert.deepEqual(placed, { leg: "out-1" });
+  const call = calls.find((c) => c.path === "/calls")!;
+  assert.equal(call.body["to"], "+14085550101");
+  assert.equal(call.body["from"], "+15106169327");
+  assert.equal(call.body["connection_id"], "conn-1");
+
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "out-1", direction: "outgoing" } });
+  const ask = calls.at(-1)!;
+  assert.match(ask.path, /out-1\/actions\/gather_using_speak$/);
+  assert.match(String(ask.body["payload"]), /Calling you into Standup\. Press 1 to join\./);
+  assert.equal(party.callersIn("482913"), 0);
+
+  await party.handle(keyed("out-1", "1"));
+  assert.equal(party.callersIn("482913"), 1);
+  assert.equal(party.participants("482913")[0]!.name, "Anthony");
+  assert.equal(party.participants("482913")[0]!.from, "+14085550101");
+});
+
+test("a dialled phone that does not press 1 is asked once more, then let go, never put in the room", async () => {
+  const { calls, fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "out-2" } } } : { ok: true }));
+  const party = line(fetch);
+  await party.dial("482913", "+14085550101", { from: "+15106169327", connectionId: "conn-1" });
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "out-2", direction: "outgoing" } });
+  await party.handle(keyed("out-2", ""));
+  assert.match(calls.at(-1)!.path, /gather_using_speak$/);
+  await party.handle(keyed("out-2", "7"));
+  assert.match(calls.at(-1)!.path, /out-2\/actions\/hangup$/);
+  assert.equal(party.callersIn("482913"), 0);
+});
+
+test("a dialled answer that arrives after a restart still knows its room, from client_state", async () => {
+  const { calls, fetch } = recorder(conferenceReplies());
+  const party = line(fetch);
+  const state = Buffer.from(JSON.stringify({ gc: "dial", code: "482913" })).toString("base64");
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "out-3", direction: "outgoing", client_state: state } });
+  assert.match(calls.at(-1)!.path, /out-3\/actions\/gather_using_speak$/);
+  await party.handle(keyed("out-3", "1"));
+  assert.equal(party.callersIn("482913"), 1);
+});
+
+test("an outbound leg somebody else placed is still left alone, client_state or not", async () => {
+  const { calls, fetch } = recorder();
+  const party = line(fetch);
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "x", direction: "outgoing", client_state: Buffer.from("{\"other\":1}").toString("base64") } });
+  assert.equal(calls.length, 0);
+});
+
+test("dial refuses a call it cannot place", async () => {
+  const { fetch } = recorder(() => ({ ok: false }));
+  const party = line(fetch);
+  assert.equal(await party.dial("482913", "+14085550101", { from: "+15106169327", connectionId: "conn-1" }), null);
+  assert.equal(await party.dial("482913", "nope", { from: "+15106169327", connectionId: "conn-1" }), null);
+});
