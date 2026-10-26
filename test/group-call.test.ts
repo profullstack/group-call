@@ -725,3 +725,61 @@ test("dial refuses a call it cannot place", async () => {
   assert.equal(await party.dial("482913", "+14085550101", { from: "+15106169327", connectionId: "conn-1" }), null);
   assert.equal(await party.dial("482913", "nope", { from: "+15106169327", connectionId: "conn-1" }), null);
 });
+
+test("a direct dial joins on answer without a word, named, and carries X- headers to a SIP URI", async () => {
+  const { calls, fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "host-1" } } } : conferenceReplies()(path)));
+  const party = line(fetch);
+  const placed = await party.dial("482913", "sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp", { from: "+15106169327", connectionId: "conn-1", name: "riotcoder", direct: true, headers: { "X-Otr-Episode": "7", "Bad Header": "no" } });
+  assert.deepEqual(placed, { leg: "host-1" });
+  const call = calls.find((c) => c.path === "/calls")!;
+  assert.equal(call.body["to"], "sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp");
+  assert.deepEqual(call.body["custom_headers"], [{ name: "X-Otr-Episode", value: "7" }]);
+
+  // No direction on the answer (a SIP URI leg): still ours, still direct.
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "host-1" } });
+  assert.equal(calls.filter((c) => /gather_using_speak|actions\/speak/.test(c.path)).length, 0);
+  assert.equal(party.callersIn("482913"), 1);
+  assert.equal(party.participants("482913")[0]!.name, "riotcoder");
+});
+
+test("a SIP URI is only dialled direct; a person's dial still needs a phone number", async () => {
+  const { fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "x" } } } : { ok: true }));
+  const party = line(fetch);
+  assert.equal(await party.dial("482913", "sip:someone@example.com", { from: "+15106169327", connectionId: "conn-1" }), null);
+});
+
+test("the leg a dial placed is never answered as if it were calling in", async () => {
+  const { calls, fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "out-9" } } } : { ok: true }));
+  const party = line(fetch);
+  await party.dial("482913", "+14085550101", { from: "+15106169327", connectionId: "conn-1" });
+  await party.handle({ event_type: "call.initiated", payload: { call_control_id: "out-9", direction: "incoming" } });
+  assert.equal(calls.filter((c) => c.path.endsWith("/actions/answer")).length, 0);
+});
+
+test("record starts once per conference, and the saved webhook names the room and the mp3", async () => {
+  const { calls, fetch } = recorder(conferenceReplies("conf-9"));
+  const seen: unknown[] = [];
+  const party = line(fetch, "", { onRecording: (r: unknown) => seen.push(r) });
+  assert.equal(await party.record("482913"), false, "nothing to record before anybody is on");
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "leg-1", direction: "incoming" } });
+  await party.handle(keyed("leg-1", "482913"));
+  assert.equal(await party.record("482913"), true);
+  assert.equal(await party.record("482913"), true);
+  const starts = calls.filter((c) => c.path === "/conferences/conf-9/actions/record_start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0]!.body["format"], "mp3");
+  assert.equal(party.recording("482913"), true);
+
+  await party.handle({ event_type: "call.hangup", payload: { call_control_id: "leg-1" } });
+  await party.handle({ event_type: "conference.recording.saved", payload: { conference_id: "conf-9", recording_id: "rec-1", recording_urls: { mp3: "https://x/a.mp3", wav: "https://x/a.wav" }, recording_started_at: "2026-10-26T00:00:00Z", recording_ended_at: "2026-10-26T01:00:00Z" } });
+  assert.deepEqual(seen, [{ code: "482913", conferenceId: "conf-9", recordingId: "rec-1", mp3: "https://x/a.mp3", wav: "https://x/a.wav", startedAt: "2026-10-26T00:00:00Z", endedAt: "2026-10-26T01:00:00Z" }]);
+});
+
+test("a recording saved after a restart still reaches the app, without a room", async () => {
+  const { fetch } = recorder();
+  const seen: { code: string | null }[] = [];
+  const party = line(fetch, "", { onRecording: (r: { code: string | null }) => seen.push(r) });
+  await party.handle({ event_type: "conference.recording.saved", payload: { conference_id: "conf-old", recording_id: "rec-2", public_recording_urls: { mp3: "https://x/b.mp3" } } });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]!.code, null);
+});
