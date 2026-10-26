@@ -625,11 +625,15 @@ export class GroupCall {
    * Telnyx itself replays the prompt (three tries) and ignores any other key,
    * so an ended gather without a 1 is a no.
    */
-  private async offer(leg: string, dialled: Dialled): Promise<void> {
+  private async offer(leg: string, dialled: Dialled, again = false): Promise<void> {
     this.dialled.delete(leg);
     const prompt = dialled.prompt ?? "This is group call, calling you into a room.";
+    const voiceWorked = !this.plainVoice.has(leg);
     await this.gather(leg, `${prompt} Press 1 to join.`, { validDigits: "1", maximumDigits: 1, timeoutMillis: 6000 }, async (digits) => {
       if (digits === "1") return this.join(leg, dialled.code, dialled.welcome);
+      // The question was never heard: the voice failed while asking it. Ask once
+      // more in the plain voice rather than hang up on somebody who picked up.
+      if (!again && voiceWorked && this.plainVoice.has(leg)) return this.offer(leg, dialled, true);
       await this.command(leg, "speak", { payload: "Okay, not joining. Goodbye.", ...this.voiceBody(leg) });
       await this.command(leg, "hangup", {});
     });
