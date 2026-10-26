@@ -8,9 +8,10 @@
     "skipLibCheck": true,
     "declaration": true,
     "types": [
-      "node",
-      "bun"
-    ]
+      "node"
+    ],
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   },
   "include": [
     "src",
