@@ -783,3 +783,18 @@ test("a recording saved after a restart still reaches the app, without a room", 
   assert.equal(seen.length, 1);
   assert.equal(seen[0]!.code, null);
 });
+
+test("a dialled phone whose press-1 prompt failed to speak is asked again in the plain voice, not hung up on", async () => {
+  const { calls, fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "out-7" } } } : conferenceReplies()(path)));
+  const party = line(fetch);
+  await party.dial("482913", "+14085550101", { from: "+15106169327", connectionId: "conn-1" });
+  await party.handle({ event_type: "call.answered", payload: { call_control_id: "out-7", direction: "outgoing" } });
+  await party.handle({ event_type: "call.speak.failed", payload: { call_control_id: "out-7" } });
+  await party.handle(keyed("out-7", ""));
+  const last = calls.at(-1)!;
+  assert.match(last.path, /out-7\/actions\/gather_using_speak$/);
+  assert.equal(last.body["voice"], "female");
+  assert.equal(calls.filter((c) => c.path.endsWith("/hangup")).length, 0);
+  await party.handle(keyed("out-7", "1"));
+  assert.equal(party.callersIn("482913"), 1);
+});
