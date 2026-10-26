@@ -544,13 +544,16 @@ export class GroupCall {
     return { leg };
   }
 
-  /** A dialled phone was picked up: press 1 to join, so voicemail never does. */
-  private async offer(leg: string, dialled: Dialled, tries = 1): Promise<void> {
+  /**
+   * A dialled phone was picked up: press 1 to join, so voicemail never does.
+   * Telnyx itself replays the prompt (three tries) and ignores any other key,
+   * so an ended gather without a 1 is a no.
+   */
+  private async offer(leg: string, dialled: Dialled): Promise<void> {
     this.dialled.delete(leg);
     const prompt = dialled.prompt ?? "This is group call, calling you into a room.";
-    await this.gather(leg, `${tries > 1 ? "" : `${prompt} `}Press 1 to join.`, { validDigits: "0123456789", maximumDigits: 1, timeoutMillis: 10000 }, async (digits) => {
+    await this.gather(leg, `${prompt} Press 1 to join.`, { validDigits: "1", maximumDigits: 1, timeoutMillis: 6000 }, async (digits) => {
       if (digits === "1") return this.join(leg, dialled.code, dialled.welcome);
-      if (tries < 2) return this.offer(leg, dialled, tries + 1);
       await this.command(leg, "speak", { payload: "Okay, not joining. Goodbye.", ...this.voiceBody(leg) });
       await this.command(leg, "hangup", {});
     });
