@@ -95,6 +95,21 @@ export interface Participant {
 interface Room extends RoomInfo {
   /** Legs currently in the room, so a caller is never counted twice. */
   legs: Map<string, Participant>;
+  /** The conference a recording was started on, or null; a remade conference is not being recorded. */
+  recordingConf?: string | null;
+}
+
+/** A finished recording of a room's conference, as Telnyx saved it. */
+export interface Recording {
+  /** The room, when this process started the recording; null after a restart lost track. */
+  code: string | null;
+  conferenceId: string;
+  recordingId: string;
+  /** Short-lived signed links; fetch the file promptly, or ask Telnyx for /recordings/{id} again. */
+  mp3: string | null;
+  wav: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
 }
 
 /** A phone being rung into a room: where it goes and what it hears on picking up. */
@@ -102,6 +117,10 @@ interface Dialled {
   code: string;
   prompt?: string;
   welcome?: string;
+  /** Straight into the room on answer, no press 1: for a machine we trust, like a voice agent. */
+  direct?: boolean;
+  /** The name the leg goes by in the room. */
+  name?: string;
 }
 
 /** The room a dialled leg's client_state names, or null when the call is not one `dial` placed. */
@@ -114,6 +133,8 @@ function dialState(raw: unknown): Dialled | null {
       code: s["code"],
       ...(typeof s["prompt"] === "string" ? { prompt: s["prompt"] } : {}),
       ...(typeof s["welcome"] === "string" ? { welcome: s["welcome"] } : {}),
+      ...(s["direct"] === true ? { direct: true } : {}),
+      ...(typeof s["name"] === "string" ? { name: s["name"] } : {}),
     };
   } catch {
     return null;
@@ -208,6 +229,8 @@ export interface GroupCallOptions {
   transcribe?: boolean | { engine?: string; language?: string };
   /** A finished line somebody said in a room (needs `transcribe`). */
   onTranscript?: (code: string, who: Participant, text: string) => void;
+  /** A room recording (see `record`) is saved on Telnyx and ready to download. */
+  onRecording?: (recording: Recording) => void;
   /** Injected for tests. */
   now?: () => number;
   fetch?: typeof globalThis.fetch;
@@ -329,6 +352,10 @@ export class GroupCall {
   private readonly dialled = new Map<string, Dialled>();
   /** How many times each leg has been asked for a code, so it is not forever. */
   private readonly asks = new Map<string, number>();
+  /** Names for legs `dial` placed with one, used when they enter. */
+  private readonly legName = new Map<string, string>();
+  /** Which room each conference we are recording belongs to, for the saved webhook. */
+  private readonly recordingRoom = new Map<string, string>();
   /** Legs whose voice failed once, which hear the plain one from then on. */
   private readonly plainVoice = new Set<string>();
   /** Names promised for callers about to arrive from a number: agents announce themselves. */
@@ -429,26 +456,56 @@ export class GroupCall {
   async handle(event: TelnyxEvent): Promise<void> {
     const type = event.event_type ?? "";
     const payload = event.payload ?? {};
+
+    // A conference event, not a leg's: it may carry no call_control_id at all.
+    if (type === "conference.recording.saved") {
+      const conferenceId = typeof payload["conference_id"] === "string" ? payload["conference_id"] : "";
+      const recordingId = typeof payload["recording_id"] === "string" ? payload["recording_id"] : "";
+      if (!conferenceId || !recordingId) return;
+      const urls = (payload["recording_urls"] ?? payload["public_recording_urls"] ?? {}) as Record<string, unknown>;
+      const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : null);
+      const code = this.recordingRoom.get(conferenceId) ?? null;
+      this.recordingRoom.delete(conferenceId);
+      this.options.onRecording?.({
+        code,
+        conferenceId,
+        recordingId,
+        mp3: str(urls["mp3"]),
+        wav: str(urls["wav"]),
+        startedAt: str(payload["recording_started_at"]),
+        endedAt: str(payload["recording_ended_at"]),
+      });
+      return;
+    }
+
     const leg = typeof payload["call_control_id"] === "string" ? payload["call_control_id"] : "";
     if (!leg) return;
 
     if (type === "call.initiated") {
       // Only inbound. An outbound leg we dialled is not somebody calling in,
       // and answering it would be answering ourselves.
-      if (payload["direction"] !== "incoming") return;
+      if (payload["direction"] !== "incoming" || this.dialled.has(leg)) return;
       if (typeof payload["from"] === "string") this.legFrom.set(leg, payload["from"]);
       await this.command(leg, "answer", {});
       return;
     }
 
     if (type === "call.answered") {
-      // An answered outbound leg is somebody else's business, unless it is one
-      // `dial` rang: then it is a person picking up, to be asked in.
-      if (payload["direction"] === "outgoing") {
-        const dialled = this.dialled.get(leg) ?? dialState(payload["client_state"]);
-        if (dialled) await this.offer(leg, dialled);
+      // A leg `dial` rang is somebody picking up, to be asked in -- checked before
+      // the direction, because a call to a SIP URI does not always say "outgoing".
+      // Any other answered outbound leg is somebody else's business.
+      const dialled = this.dialled.get(leg) ?? dialState(payload["client_state"]);
+      if (dialled?.direct) {
+        this.dialled.delete(leg);
+        if (dialled.name) this.legName.set(leg, dialled.name);
+        await this.join(leg, dialled.code, null);
         return;
       }
+      if (dialled) {
+        await this.offer(leg, dialled);
+        return;
+      }
+      if (payload["direction"] === "outgoing") return;
       await this.ask(leg);
       return;
     }
@@ -505,6 +562,7 @@ export class GroupCall {
       this.release(leg);
       this.legFrom.delete(leg);
       this.dialled.delete(leg);
+      this.legName.delete(leg);
       this.pendingGather.delete(leg);
       this.asks.delete(leg);
       this.plainVoice.delete(leg);
@@ -523,23 +581,41 @@ export class GroupCall {
    * room. The room is carried in the call's client_state too, so an answer
    * that arrives after a restart still knows where it was going. Returns the
    * new leg, or null when Telnyx would not place the call.
+   *
+   * `direct` skips the press-1 question and joins on answer, silently: for a
+   * machine that will not press anything, like a voice agent. `to` may then be
+   * a SIP URI (`sip:+1555...@sip.example.com`), and `headers` are sent on the
+   * INVITE as custom X- headers, which is how such an agent is told what call
+   * this is.
    */
-  async dial(code: string, to: string, opts: { from: string; connectionId: string; name?: string; prompt?: string; welcome?: string; timeoutSecs?: number }): Promise<{ leg: string } | null> {
-    const number = normalNumber(to);
+  async dial(code: string, to: string, opts: { from: string; connectionId: string; name?: string; prompt?: string; welcome?: string; timeoutSecs?: number; direct?: boolean; headers?: Record<string, string> }): Promise<{ leg: string } | null> {
+    const sip = opts.direct === true && /^sips?:[^\s@]+@[^\s@]+$/i.test(to.trim());
+    const number = sip ? to.trim() : normalNumber(to);
     if (!number || !opts.connectionId || !opts.from) return null;
-    const state: Dialled = { code, ...(opts.prompt ? { prompt: opts.prompt.slice(0, 300) } : {}), ...(opts.welcome ? { welcome: opts.welcome.slice(0, 200) } : {}) };
+    const state: Dialled = {
+      code,
+      ...(opts.prompt ? { prompt: opts.prompt.slice(0, 300) } : {}),
+      ...(opts.welcome ? { welcome: opts.welcome.slice(0, 200) } : {}),
+      ...(opts.direct ? { direct: true } : {}),
+      ...(opts.direct && opts.name ? { name: opts.name.slice(0, 60) } : {}),
+    };
+    const headers = Object.entries(opts.headers ?? {})
+      .filter(([name]) => /^X-[A-Za-z0-9-]{1,60}$/.test(name))
+      .map(([name, value]) => ({ name, value: String(value).slice(0, 200) }));
     const placed = (await this.request("/calls", {
       connection_id: opts.connectionId,
       to: number,
       from: normalNumber(opts.from),
       timeout_secs: opts.timeoutSecs ?? 30,
       client_state: Buffer.from(JSON.stringify({ gc: "dial", ...state }), "utf8").toString("base64"),
+      ...(headers.length ? { custom_headers: headers } : {}),
     })) as { data?: { call_control_id?: string } } | null;
     const leg = placed?.data?.call_control_id;
     if (typeof leg !== "string") return null;
     this.dialled.set(leg, state);
     this.legFrom.set(leg, number);
-    if (opts.name) this.expect(code, number, opts.name, 5 * 60 * 1000);
+    if (opts.name && opts.direct) this.legName.set(leg, opts.name.slice(0, 60));
+    else if (opts.name) this.expect(code, number, opts.name, 5 * 60 * 1000);
     this.options.onEvent?.(`  ringing a phone into a room.`);
     return { leg };
   }
@@ -649,9 +725,9 @@ export class GroupCall {
    * Put a leg into a room, making the conference if it is the first one there.
    *
    * `welcome` is what the caller hears once they are in, before the count of
-   * who else is.
+   * who else is; null joins them without a word.
    */
-  async join(leg: string, code: string, welcome = `Welcome to room ${spokenCode(code)}. `): Promise<void> {
+  async join(leg: string, code: string, welcome: string | null = `Welcome to room ${spokenCode(code)}. `): Promise<void> {
     const room = this.room(code);
 
     if (room.callers >= this.maxParticipants) {
@@ -757,7 +833,7 @@ export class GroupCall {
   private enter(room: Room, leg: string): void {
     if (room.legs.has(leg)) return;
     const from = this.legFrom.get(leg) ?? "";
-    const who: Participant = { leg, from, name: this.claimName(room.code, from), joinedAt: this.now() };
+    const who: Participant = { leg, from, name: this.legName.get(leg) || this.claimName(room.code, from), joinedAt: this.now() };
     room.legs.set(leg, who);
     room.callers = room.legs.size;
     this.options.onEvent?.(`  ${who.name || "a caller"} joined a room (${room.callers} on the line).`);
@@ -794,8 +870,8 @@ export class GroupCall {
    * addresses conference speech to particular participants, so the others in
    * the room do not hear every arrival welcomed.
    */
-  private async greet(room: Room, leg: string, welcome: string): Promise<void> {
-    if (room.conferenceId === null) return;
+  private async greet(room: Room, leg: string, welcome: string | null): Promise<void> {
+    if (room.conferenceId === null || welcome === null) return;
     await this.request(`/conferences/${encodeURIComponent(room.conferenceId)}/actions/speak`, {
       payload: `${welcome}${peopleHere(room.callers)}`,
       ...this.voiceBody(leg),
@@ -820,6 +896,51 @@ export class GroupCall {
       ...(voiceSettings ? { voice_settings: voiceSettings } : {}),
     });
     return answer !== null;
+  }
+
+  /**
+   * Record the room's conference, everyone mixed into one file. Runs until the
+   * conference ends (the last caller leaves) or `stopRecording`; `onRecording`
+   * hears when the file is saved. False when nobody is on the line yet, since
+   * there is no conference to record until somebody is.
+   */
+  async record(code: string, opts: { format?: "mp3" | "wav"; beep?: boolean } = {}): Promise<boolean> {
+    const room = this.rooms.get(code);
+    if (!room || room.conferenceId === null || room.callers === 0) return false;
+    if (room.recordingConf === room.conferenceId) return true;
+    const started = await this.request(`/conferences/${encodeURIComponent(room.conferenceId)}/actions/record_start`, {
+      format: opts.format ?? "mp3",
+      play_beep: opts.beep ?? false,
+    });
+    if (started === null) return false;
+    room.recordingConf = room.conferenceId;
+    this.recordingRoom.set(room.conferenceId, code);
+    this.options.onEvent?.(`  recording a room.`);
+    return true;
+  }
+
+  /** Whether this process is recording the room's current conference. */
+  recording(code: string): boolean {
+    const room = this.rooms.get(code);
+    return Boolean(room && room.conferenceId !== null && room.recordingConf === room.conferenceId);
+  }
+
+  /** Stop recording; the file is saved and `onRecording` follows. */
+  async stopRecording(code: string): Promise<boolean> {
+    const room = this.rooms.get(code);
+    if (!room || room.conferenceId === null || room.recordingConf !== room.conferenceId) return false;
+    const stopped = await this.request(`/conferences/${encodeURIComponent(room.conferenceId)}/actions/record_stop`, {});
+    if (stopped !== null) room.recordingConf = null;
+    return stopped !== null;
+  }
+
+  /** A saved recording's current download links, for when the webhook's have expired. */
+  async recordingLinks(recordingId: string): Promise<{ mp3: string | null; wav: string | null } | null> {
+    const got = (await this.get(`/recordings/${encodeURIComponent(recordingId)}`)) as { data?: { download_urls?: Record<string, unknown> } } | null;
+    const urls = got?.data?.download_urls;
+    if (!urls) return null;
+    const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : null);
+    return { mp3: str(urls["mp3"]), wav: str(urls["wav"]) };
   }
 
   /** Hang up one participant in a room. */

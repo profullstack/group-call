@@ -46,6 +46,13 @@ await line.handle(JSON.parse(rawBody).data);
 - **Call people in.** `dial(code, phone, { from, connectionId, name?, prompt? })` rings a phone
   from your number. Whoever answers presses 1 and is in the room, so voicemail never joins.
   The room rides in the call's `client_state`, so an answer after a restart still lands right.
+- **Call a voice agent in.** `dial(code, "sip:+1555...@sip.rtc.elevenlabs.io", { ..., direct: true, name, headers })`
+  joins on answer with no press 1 and no greeting, and sends `headers` (`X-...` only) on the INVITE.
+  ElevenLabs Agents expose them as dynamic variables (`X-Otr-Episode` -> `{{sip_otr_episode}}`).
+- **Record a room.** `record(code)` records the conference, everyone mixed, as mp3 (or wav) until it
+  ends or `stopRecording(code)`. `onRecording({ code, conferenceId, recordingId, mp3, wav, ... })` fires
+  on `conference.recording.saved`; the links are short-lived, so download straight away, or get fresh
+  ones with `recordingLinks(recordingId)`.
 - **Room API.** `say(code, text, voice?)` speaks into a room. Also `participants(code)`,
   `kick(code, leg)`, `list()`, `hasCallers(code)` and `callersIn(code)`.
 - **App hooks.** `onCode` can join, welcome, reject, or take the call over: `call.gather(...)`
