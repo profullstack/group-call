@@ -52,6 +52,9 @@ await line.handle(JSON.parse(rawBody).data);
   Telnyx bills this per minute per leg, so it's off unless you ask for it.
 - **Survives restarts.** Conference names carry a keyed hash of the room code. After a restart,
   the first caller into a room joins its running conference, not a new one.
+- **Deploy-proof rooms.** Save `participants(code)` plus each room's conference id from `onJoin`/`onLeave`,
+  and pass them to `restore()` at boot. Each conference is checked against Telnyx, and the legs still in
+  it come back with their names, so a restart neither splits a room nor forgets who is in it.
 - `telnyxSms`, `verifyTelnyx`, `newRoomCode`, `sameSecret` helpers.
 
 MIT

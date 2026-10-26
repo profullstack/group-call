@@ -645,3 +645,26 @@ test("after a restart, a caller joins the room's running conference, not a new o
   assert.ok(calls.some((c) => c.path === "/conferences/conf-old/actions/join"));
   assert.equal(after.callersIn("4821"), 2);
 });
+
+test("a new process restores saved rooms that are still running, names and all, and drops the ones that ended", async () => {
+  const fetch = (async (url: string | URL | Request) => {
+    const path = String(url).replace("https://api.telnyx.com/v2", "");
+    if (path === "/conferences/conf-live") return new Response(JSON.stringify({ data: { id: "conf-live", status: "in_progress" } }));
+    if (path === "/conferences/conf-done") return new Response(JSON.stringify({ data: { id: "conf-done", status: "completed" } }));
+    if (path.startsWith("/conferences/conf-live/participants")) return new Response(JSON.stringify({ data: [{ call_control_id: "leg-a", status: "joined" }, { call_control_id: "leg-b", status: "joined" }] }));
+    return new Response("{}");
+  }) as unknown as typeof globalThis.fetch;
+  const lines: string[] = [];
+  const call = four(fetch, { transcribe: true, onTranscript: (_c: string, who: { name: string }, text: string) => lines.push(`${who.name}: ${text}`) });
+  const r = await call.restore([
+    { code: "4821", conferenceId: "conf-live", startedAt: NOW - 60_000, participants: [{ leg: "leg-a", from: "+19492847328", name: "riotcoder", joinedAt: NOW - 50_000 }, { leg: "leg-gone", from: "+1555", name: "", joinedAt: NOW - 40_000 }] },
+    { code: "7310", conferenceId: "conf-done", startedAt: NOW - 60_000, participants: [] },
+  ]);
+  assert.deepEqual(r, { rooms: 1, legs: 2 });
+  assert.equal(call.callersIn("4821"), 2);
+  assert.equal(call.callersIn("7310"), 0);
+  assert.deepEqual(call.participants("4821").map((p) => p.name).sort(), ["", "riotcoder"]);
+  // Its transcript keeps flowing under the right name.
+  await call.handle({ event_type: "call.transcription", payload: { call_control_id: "leg-a", transcription_data: { transcript: "still here", is_final: true } } });
+  assert.deepEqual(lines, ["riotcoder: still here"]);
+});

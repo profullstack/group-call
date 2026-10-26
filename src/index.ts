@@ -343,6 +343,39 @@ export class GroupCall {
       .sort((a, b) => b.callers - a.callers || a.startedAt - b.startedAt);
   }
 
+  /**
+   * Put back rooms a previous process knew about: a deploy or a crash must not
+   * split a room. Each saved conference is checked against Telnyx, and only the
+   * legs still in it come back, with their names. A leg Telnyx has that the save
+   * missed comes back unnamed. Returns how many rooms and legs were restored.
+   */
+  async restore(saved: { code: string; conferenceId: string; startedAt: number; participants: Participant[] }[]): Promise<{ rooms: number; legs: number }> {
+    let rooms = 0
+    let legs = 0
+    for (const r of saved) {
+      const conf = (await this.get(`/conferences/${encodeURIComponent(r.conferenceId)}`)) as { data?: { status?: string } } | null
+      if (!conf?.data || (conf.data.status && conf.data.status !== "in_progress")) continue
+      const list = (await this.get(`/conferences/${encodeURIComponent(r.conferenceId)}/participants?page[size]=100`)) as { data?: { call_control_id?: string; status?: string }[] } | null
+      const present = new Set((list?.data ?? []).filter((p) => p.status !== "left" && typeof p.call_control_id === "string").map((p) => p.call_control_id as string))
+      if (present.size === 0) continue
+      const room = this.room(r.code)
+      room.conferenceId = r.conferenceId
+      room.startedAt = r.startedAt
+      const known = new Map(r.participants.map((p) => [p.leg, p]))
+      for (const leg of present) {
+        const who = known.get(leg) ?? { leg, from: "", name: "", joinedAt: r.startedAt }
+        room.legs.set(leg, who)
+        this.legRoom.set(leg, r.code)
+        if (who.from) this.legFrom.set(leg, who.from)
+        legs += 1
+      }
+      room.callers = room.legs.size
+      rooms += 1
+    }
+    if (rooms) this.options.onEvent?.(`  restored ${rooms} room(s) with ${legs} on the line.`)
+    return { rooms, legs }
+  }
+
   /** Who is on the line in a room, earliest first. */
   participants(code: string): Participant[] {
     const room = this.rooms.get(code);
