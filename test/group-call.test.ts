@@ -691,14 +691,13 @@ test("dial rings a phone from the room's number, and the answer is asked to pres
   assert.equal(party.participants("482913")[0]!.from, "+14085550101");
 });
 
-test("a dialled phone that does not press 1 is asked once more, then let go, never put in the room", async () => {
+test("a dialled phone that does not press 1 is let go, never put in the room", async () => {
   const { calls, fetch } = recorder((path) => (path === "/calls" ? { ok: true, json: { data: { call_control_id: "out-2" } } } : { ok: true }));
   const party = line(fetch);
   await party.dial("482913", "+14085550101", { from: "+15106169327", connectionId: "conn-1" });
   await party.handle({ event_type: "call.answered", payload: { call_control_id: "out-2", direction: "outgoing" } });
+  assert.equal(calls.at(-1)!.body["valid_digits"], "1");
   await party.handle(keyed("out-2", ""));
-  assert.match(calls.at(-1)!.path, /gather_using_speak$/);
-  await party.handle(keyed("out-2", "7"));
   assert.match(calls.at(-1)!.path, /out-2\/actions\/hangup$/);
   assert.equal(party.callersIn("482913"), 0);
 });
