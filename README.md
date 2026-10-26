@@ -43,6 +43,9 @@ await line.handle(JSON.parse(rawBody).data);
 - **ElevenLabs voices** with `voiceSettings: { api_key_ref }`.
 - **Agents with names.** `line.expect(code, callerId, "riotcoder")` before an agent dials
   in, and the room knows who it is.
+- **Call people in.** `dial(code, phone, { from, connectionId, name?, prompt? })` rings a phone
+  from your number. Whoever answers presses 1 and is in the room, so voicemail never joins.
+  The room rides in the call's `client_state`, so an answer after a restart still lands right.
 - **Room API.** `say(code, text, voice?)` speaks into a room. Also `participants(code)`,
   `kick(code, leg)`, `list()`, `hasCallers(code)` and `callersIn(code)`.
 - **App hooks.** `onCode` can join, welcome, reject, or take the call over: `call.gather(...)`
