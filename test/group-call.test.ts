@@ -597,3 +597,51 @@ test("a new room code is never an easy one and never a taken one", async () => {
   const taken = new Set(["5678"]);
   assert.equal(taken.has(newRoomCode(4, (c) => taken.has(c))), false);
 });
+
+test("with transcribe on, each participant's own leg is transcribed and lines come back with the speaker", async () => {
+  const { calls, fetch } = recorder(conferenceReplies());
+  const lines: string[] = [];
+  const call = four(fetch, { transcribe: true, onTranscript: (code: string, who: { name: string; from: string }, text: string) => lines.push(`${code} ${who.name || who.from}: ${text}`) });
+  call.expect("4821", "+19492847328", "riotcoder");
+  await call.handle({ event_type: "call.initiated", payload: { call_control_id: "leg-a", direction: "incoming", from: "+19492847328" } });
+  await call.handle(keyed("leg-a", "4821"));
+  const start = calls.find((c) => c.path === "/calls/leg-a/actions/transcription_start");
+  assert.equal(start?.body["transcription_tracks"], "inbound");
+  await call.handle({ event_type: "call.transcription", payload: { call_control_id: "leg-a", transcription_data: { transcript: "hello there", is_final: false } } });
+  await call.handle({ event_type: "call.transcription", payload: { call_control_id: "leg-a", transcription_data: { transcript: " Hi everyone. ", is_final: true } } });
+  // A leg that is in no room is nobody's line.
+  await call.handle({ event_type: "call.transcription", payload: { call_control_id: "leg-z", transcription_data: { transcript: "stray", is_final: true } } });
+  assert.deepEqual(lines, ["4821 riotcoder: Hi everyone."]);
+});
+
+test("without transcribe, nothing is transcribed", async () => {
+  const { calls, fetch } = recorder(conferenceReplies());
+  const call = four(fetch);
+  await call.handle(keyed("leg-a", "4821"));
+  assert.equal(calls.some((c) => c.path.endsWith("/transcription_start")), false);
+});
+
+test("after a restart, a caller joins the room's running conference, not a new one", async () => {
+  const calls: { method: string; path: string }[] = [];
+  let name = "";
+  const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const path = String(url).replace("https://api.telnyx.com/v2", "");
+    const method = init?.method ?? "GET";
+    calls.push({ method, path });
+    if (method === "POST" && path === "/conferences") {
+      name = JSON.parse(String(init?.body)).name;
+      return new Response(JSON.stringify({ data: { id: "conf-old" } }));
+    }
+    if (method === "GET" && path.startsWith("/conferences?")) return new Response(JSON.stringify({ data: [{ id: "conf-old", name, created_at: new Date(NOW).toISOString() }] }));
+    if (method === "GET" && path.includes("/participants")) return new Response(JSON.stringify({ data: [{ call_control_id: "leg-1", status: "joined" }] }));
+    return new Response("{}");
+  }) as unknown as typeof globalThis.fetch;
+  const before = four(fetch);
+  await before.handle(keyed("leg-1", "4821"));
+  assert.ok(name && !name.includes("4821"), "the name hides the code");
+  const after = four(fetch); // a new process: empty map
+  await after.handle(keyed("leg-2", "4821"));
+  assert.equal(calls.filter((c) => c.method === "POST" && c.path === "/conferences").length, 1);
+  assert.ok(calls.some((c) => c.path === "/conferences/conf-old/actions/join"));
+  assert.equal(after.callersIn("4821"), 2);
+});

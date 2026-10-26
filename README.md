@@ -47,6 +47,11 @@ await line.handle(JSON.parse(rawBody).data);
   `kick(code, leg)`, `list()`, `hasCallers(code)` and `callersIn(code)`.
 - **App hooks.** `onCode` can join, welcome, reject, or take the call over: `call.gather(...)`
   asks another question (nixamp's "press 1 for a text").
+- **Live transcripts.** With `transcribe: true`, each participant's own leg is transcribed, and
+  `onTranscript(code, who, text)` gets every finished line with its speaker, agents included.
+  Telnyx bills this per minute per leg, so it's off unless you ask for it.
+- **Survives restarts.** Conference names carry a keyed hash of the room code. After a restart,
+  the first caller into a room joins its running conference, not a new one.
 - `telnyxSms`, `verifyTelnyx`, `newRoomCode`, `sameSecret` helpers.
 
 MIT

@@ -25,7 +25,7 @@
  * conversation with nothing to tell them they went wrong. An agent keys it
  * too, with DTMF, so a person and an agent arrive the same way.
  */
-import { createPublicKey, verify as verifySignature, timingSafeEqual } from "node:crypto";
+import { createHmac, createPublicKey, verify as verifySignature, timingSafeEqual } from "node:crypto";
 
 /** Where Telnyx's REST API lives. */
 export const TELNYX_API = "https://api.telnyx.com/v2";
@@ -178,6 +178,13 @@ export interface GroupCallOptions {
   onJoin?: (code: string, who: Participant, room: RoomInfo) => void;
   /** A person or agent left a room. */
   onLeave?: (code: string, who: Participant, room: RoomInfo) => void;
+  /**
+   * Transcribe what each participant says, on their own leg, so every line has a
+   * speaker. Telnyx bills it per minute per leg; off unless asked for.
+   */
+  transcribe?: boolean | { engine?: string; language?: string };
+  /** A finished line somebody said in a room (needs `transcribe`). */
+  onTranscript?: (code: string, who: Participant, text: string) => void;
   /** Injected for tests. */
   now?: () => number;
   fetch?: typeof globalThis.fetch;
@@ -421,6 +428,16 @@ export class GroupCall {
       return;
     }
 
+    if (type === "call.transcription") {
+      const data = (payload["transcription_data"] ?? {}) as Record<string, unknown>;
+      const text = typeof data["transcript"] === "string" ? data["transcript"].trim() : "";
+      if (!text || data["is_final"] === false) return;
+      const code = this.legRoom.get(leg);
+      const who = code !== undefined ? this.rooms.get(code)?.legs.get(leg) : undefined;
+      if (code !== undefined && who) this.options.onTranscript?.(code, who, text);
+      return;
+    }
+
     if (type === "conference.participant.left" || type === "call.hangup") {
       this.release(leg);
       this.legFrom.delete(leg);
@@ -552,8 +569,23 @@ export class GroupCall {
       room.conferenceId = null;
     }
 
+    // After a restart our map is empty, but the room's conference may still be
+    // running with people in it: find it by name and join that, not a new one.
+    if (room.conferenceId === null && (await this.recover(room))) {
+      const joined = await this.request(
+        `/conferences/${encodeURIComponent(room.conferenceId!)}/actions/join`,
+        { call_control_id: leg, start_conference_on_enter: true },
+      );
+      if (joined !== null) {
+        this.enter(room, leg);
+        await this.greet(room, leg, welcome);
+        return;
+      }
+      room.conferenceId = null;
+    }
+
     const created = await this.request("/conferences", {
-      name: `${this.options.conferencePrefix ?? "groupcall"}-${this.now()}-${room.legs.size}`,
+      name: `${this.conferenceName(code)}${this.now()}`,
       call_control_id: leg,
       start_conference_on_create: true,
       max_participants: this.maxParticipants,
@@ -576,6 +608,41 @@ export class GroupCall {
     await this.greet(room, leg, welcome);
   }
 
+  /**
+   * A conference's name: findable again after a restart, but not the code itself,
+   * which would be a room's whole key sitting in somebody else's dashboard. A
+   * hash keyed with the API key, so it cannot be walked back to the code.
+   */
+  private conferenceName(code: string): string {
+    const tag = createHmac("sha256", this.options.apiKey).update(`room:${code}`).digest("hex").slice(0, 12);
+    return `${this.options.conferencePrefix ?? "groupcall"}-${tag}-`;
+  }
+
+  /**
+   * Find this room's conference on Telnyx if it is still running, and the legs
+   * already in it. True when one was found.
+   */
+  private async recover(room: Room): Promise<boolean> {
+    const list = await this.get(`/conferences?filter[status]=in_progress&page[size]=250`);
+    const found = ((list as { data?: { id?: string; name?: string; created_at?: string }[] } | null)?.data ?? [])
+      .filter((c) => typeof c.id === "string" && String(c.name ?? "").startsWith(this.conferenceName(room.code)))
+      .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))[0];
+    if (!found?.id) return false;
+    room.conferenceId = found.id;
+    const created = Date.parse(found.created_at ?? "");
+    room.startedAt = Number.isFinite(created) ? created : this.now();
+    const people = await this.get(`/conferences/${encodeURIComponent(found.id)}/participants?page[size]=100`);
+    for (const p of (people as { data?: { call_control_id?: string; status?: string }[] } | null)?.data ?? []) {
+      const id = p.call_control_id;
+      if (typeof id !== "string" || p.status === "left" || room.legs.has(id)) continue;
+      room.legs.set(id, { leg: id, from: "", name: "", joinedAt: room.startedAt });
+      this.legRoom.set(id, room.code);
+    }
+    room.callers = room.legs.size;
+    this.options.onEvent?.(`  found room ${room.code}'s conference still running (${room.callers} on the line).`);
+    return true;
+  }
+
   private enter(room: Room, leg: string): void {
     if (room.legs.has(leg)) return;
     const from = this.legFrom.get(leg) ?? "";
@@ -584,6 +651,16 @@ export class GroupCall {
     room.callers = room.legs.size;
     this.options.onEvent?.(`  ${who.name || "a caller"} joined a room (${room.callers} on the line).`);
     this.options.onJoin?.(room.code, who, this.info(room));
+    const t = this.options.transcribe;
+    if (t) {
+      const opts = typeof t === "object" ? t : {};
+      // Only what this participant says (their side of the leg), so each line has one speaker.
+      void this.command(leg, "transcription_start", {
+        language: opts.language ?? "en",
+        transcription_engine: opts.engine ?? "Deepgram",
+        transcription_tracks: "inbound",
+      });
+    }
   }
 
   /** The name an agent registered for this number and room, used once. */
@@ -706,6 +783,22 @@ export class GroupCall {
   protected async command(leg: string, action: string, body: unknown): Promise<boolean> {
     const path = `/calls/${encodeURIComponent(leg)}/actions/${action}`;
     return (await this.request(path, body)) !== null;
+  }
+
+  /** A GET from Telnyx, or null if it did not work. */
+  protected async get(path: string): Promise<unknown | null> {
+    try {
+      const response = await this.fetch(`${TELNYX_API}${path}`, { headers: { authorization: `Bearer ${this.options.apiKey}` } });
+      if (!response.ok) {
+        this.options.onEvent?.(`  telnyx GET ${path} -> ${response.status}`);
+        return null;
+      }
+      const text = await response.text();
+      return text ? (JSON.parse(text) as unknown) : {};
+    } catch (error) {
+      this.options.onEvent?.(`  telnyx GET ${path} failed: ${(error as Error).message}`);
+      return null;
+    }
   }
 
   /** A POST to Telnyx, or null if it did not work. */
