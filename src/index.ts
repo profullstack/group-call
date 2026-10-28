@@ -64,6 +64,12 @@ const SIGNATURE_TOLERANCE_MS = 5 * 60 * 1000;
 /** A conference Telnyx will discard on its own, so we stop trusting ours first. */
 const CONFERENCE_TTL_MS = 4 * 60 * 60 * 1000;
 
+/** Keys after * that sit longer than this are dropped: the next * starts over. */
+const INVITE_KEYING_MS = 30 * 1000;
+
+/** No phone number is longer (E.164 caps at fifteen digits). */
+const MAX_INVITE_DIGITS = 15;
+
 const NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
 
 /** "six digit", said rather than written. */
@@ -227,6 +233,15 @@ export interface GroupCallOptions {
    * speaker. Telnyx bills it per minute per leg; off unless asked for.
    */
   transcribe?: boolean | { engine?: string; language?: string };
+  /**
+   * Somebody already in a room pressed *, a phone number and #: they want that
+   * number called in. Whoever is on the line can do it, a person on their
+   * keypad or an agent sending DTMF on its leg. The app decides whether it may
+   * (who pays, how many an hour, which countries) and usually rings the number
+   * with `dial`. What it returns is said to the one who asked. Without this
+   * hook, keys pressed in a room are ignored.
+   */
+  onInvite?: (code: string, who: Participant, digits: string) => Promise<string> | string;
   /** A finished line somebody said in a room (needs `transcribe`). */
   onTranscript?: (code: string, who: Participant, text: string) => void;
   /** A room recording (see `record`) is saved on Telnyx and ready to download. */
@@ -358,6 +373,8 @@ export class GroupCall {
   private readonly recordingRoom = new Map<string, string>();
   /** Legs whose voice failed once, which hear the plain one from then on. */
   private readonly plainVoice = new Set<string>();
+  /** Legs in a room partway through keying a number to call in (after *, before #). */
+  private readonly keying = new Map<string, { digits: string; at: number }>();
   /** Names promised for callers about to arrive from a number: agents announce themselves. */
   private readonly expected: { code: string; from: string; name: string; until: number }[] = [];
   private readonly key: ReturnType<typeof createPublicKey> | null;
@@ -548,6 +565,12 @@ export class GroupCall {
       return;
     }
 
+    if (type === "call.dtmf.received") {
+      const digit = typeof payload["digit"] === "string" ? payload["digit"] : "";
+      await this.keyPressed(leg, digit);
+      return;
+    }
+
     if (type === "call.transcription") {
       const data = (payload["transcription_data"] ?? {}) as Record<string, unknown>;
       const text = typeof data["transcript"] === "string" ? data["transcript"].trim() : "";
@@ -566,8 +589,63 @@ export class GroupCall {
       this.pendingGather.delete(leg);
       this.asks.delete(leg);
       this.plainVoice.delete(leg);
+      this.keying.delete(leg);
       return;
     }
+  }
+
+  /**
+   * A key pressed by somebody already in a room: * starts a number to call in,
+   * # sends it, * again while keying calls it off.
+   *
+   * Only legs in a room, and only with an `onInvite` hook: keys pressed while a
+   * caller is still being asked for a code are that question's answer, and
+   * arrive here too. The prompt goes to the presser's leg alone, so the room is
+   * not read a phone number it did not ask about.
+   */
+  private async keyPressed(leg: string, digit: string): Promise<void> {
+    if (!this.options.onInvite || !/^[0-9*#]$/.test(digit)) return;
+    const code = this.legRoom.get(leg);
+    const who = code !== undefined ? this.rooms.get(code)?.legs.get(leg) : undefined;
+    if (code === undefined || !who || this.pendingGather.has(leg)) return;
+
+    const now = this.now();
+    let keying = this.keying.get(leg);
+    if (keying && now - keying.at > INVITE_KEYING_MS) {
+      this.keying.delete(leg);
+      keying = undefined;
+    }
+    const tell = (text: string) => this.command(leg, "speak", { payload: text, ...this.voiceBody(leg) });
+
+    if (!keying) {
+      if (digit !== "*") return;
+      this.keying.set(leg, { digits: "", at: now });
+      await tell("To call someone in, enter their phone number, then press pound. Press star to cancel.");
+      return;
+    }
+    if (digit === "*") {
+      this.keying.delete(leg);
+      await tell("Cancelled.");
+      return;
+    }
+    if (digit !== "#") {
+      if (keying.digits.length < MAX_INVITE_DIGITS) keying.digits += digit;
+      keying.at = now;
+      return;
+    }
+    this.keying.delete(leg);
+    if (!keying.digits) {
+      await tell("I did not get a number. Press star to try again.");
+      return;
+    }
+    let reply: string;
+    try {
+      reply = await this.options.onInvite(code, who, keying.digits);
+    } catch (e) {
+      this.options.onEvent?.(`  an in-call invite failed: ${(e as Error).message}`);
+      reply = "That call could not be placed.";
+    }
+    if (reply) await tell(reply);
   }
 
   /**
