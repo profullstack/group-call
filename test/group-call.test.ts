@@ -798,3 +798,64 @@ test("a dialled phone whose press-1 prompt failed to speak is asked again in the
   await party.handle(keyed("out-7", "1"));
   assert.equal(party.callersIn("482913"), 1);
 });
+
+/** A key pressed on a leg, as Telnyx reports it. */
+const pressed = (leg: string, digits: string) =>
+  digits.split("").map((digit) => ({ event_type: "call.dtmf.received", payload: { call_control_id: leg, digit } }));
+
+test("somebody in a room presses *, a number and #, and the app is asked to call it in", async () => {
+  const { calls, fetch } = recorder(conferenceReplies("conf-9"));
+  const invites: { code: string; leg: string; digits: string }[] = [];
+  const party = line(fetch, "", {
+    onInvite: async (code: string, who: { leg: string }, digits: string) => {
+      invites.push({ code, leg: who.leg, digits });
+      return "Calling them now.";
+    },
+  });
+  await party.handle(keyed("leg-1", "482917"));
+  for (const e of pressed("leg-1", "*4085550101#")) await party.handle(e);
+  assert.deepEqual(invites, [{ code: "482917", leg: "leg-1", digits: "4085550101" }]);
+  const said = calls.filter((c) => c.path === "/calls/leg-1/actions/speak").map((c) => c.body["payload"]);
+  assert.match(String(said.at(-2)), /enter their phone number/);
+  assert.equal(said.at(-1), "Calling them now.");
+});
+
+test("star again calls it off, and a keying left too long starts over", async () => {
+  const { fetch } = recorder(conferenceReplies());
+  let now = NOW;
+  const invites: string[] = [];
+  const party = new GroupCall({ apiKey: "KEY_test", publicKey: "", fetch, now: () => now, codeLength: 6, onInvite: (_c, _w, digits) => (invites.push(digits), "ok") });
+  await party.handle(keyed("leg-1", "482917"));
+  for (const e of pressed("leg-1", "*408*#")) await party.handle(e);
+  assert.deepEqual(invites, [], "cancelled, then # alone is not a number");
+  for (const e of pressed("leg-1", "*408")) await party.handle(e);
+  now += 60_000;
+  for (const e of pressed("leg-1", "555#")) await party.handle(e);
+  assert.deepEqual(invites, [], "the stale keying is dropped, so 555# is just keys");
+  for (const e of pressed("leg-1", "*5105550101#")) await party.handle(e);
+  assert.deepEqual(invites, ["5105550101"]);
+});
+
+test("keys are ignored without onInvite, and from a caller not yet in a room", async () => {
+  const { calls, fetch } = recorder(conferenceReplies());
+  const invites: string[] = [];
+  const party = line(fetch, "", { onInvite: (_c: string, _w: unknown, d: string) => (invites.push(d), "ok") });
+  for (const e of pressed("leg-x", "*4085550101#")) await party.handle(e);
+  assert.deepEqual(invites, []);
+  assert.equal(calls.length, 0);
+
+  const plain = recorder(conferenceReplies());
+  const nixamp = line(plain.fetch);
+  await nixamp.handle(keyed("leg-1", "482917"));
+  const before = plain.calls.length;
+  for (const e of pressed("leg-1", "*4085550101#")) await nixamp.handle(e);
+  assert.equal(plain.calls.length, before, "no hook, no prompt");
+});
+
+test("a hook that throws is told to the caller, not swallowed in silence", async () => {
+  const { calls, fetch } = recorder(conferenceReplies());
+  const party = line(fetch, "", { onInvite: async () => { throw new Error("boom"); } });
+  await party.handle(keyed("leg-1", "482917"));
+  for (const e of pressed("leg-1", "*4085550101#")) await party.handle(e);
+  assert.equal(calls.at(-1)?.body["payload"], "That call could not be placed.");
+});

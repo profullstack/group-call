@@ -46,6 +46,10 @@ await line.handle(JSON.parse(rawBody).data);
 - **Call people in.** `dial(code, phone, { from, connectionId, name?, prompt? })` rings a phone
   from your number. Whoever answers presses 1 and is in the room, so voicemail never joins.
   The room rides in the call's `client_state`, so an answer after a restart still lands right.
+- **Call people in from the call.** With `onInvite(code, who, digits)`, anyone already in a room
+  presses `*`, a phone number and `#` (`*` again cancels): a person on their keypad, or an agent
+  sending DTMF on its leg. The app decides whether it may and usually calls `dial`; the string it
+  returns is said to whoever asked. Without the hook, keys pressed in a room do nothing.
 - **Call a voice agent in.** `dial(code, "sip:+1555...@sip.rtc.elevenlabs.io", { ..., direct: true, name, headers })`
   joins on answer with no press 1 and no greeting, and sends `headers` (`X-...` only) on the INVITE.
   ElevenLabs Agents expose them as dynamic variables (`X-Otr-Episode` -> `{{sip_otr_episode}}`).

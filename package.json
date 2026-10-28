@@ -1,20 +1,40 @@
 {
   "name": "@profullstack/group-call",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "A group call on a phone number: dial in, key a room code, talk with everyone else who did, people and AI agents alike. Telnyx Call Control state machine extracted from nixamp's party line; the engine behind nixamp live joins and group.call.pit.world.",
   "license": "MIT",
   "type": "module",
-  "repository": { "type": "git", "url": "git+https://github.com/profullstack/group-call.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/profullstack/group-call.git"
+  },
   "homepage": "https://group.call.pit.world",
-  "keywords": ["telnyx", "conference", "party line", "group call", "phone", "agents", "voice"],
+  "keywords": [
+    "telnyx",
+    "conference",
+    "party line",
+    "group call",
+    "phone",
+    "agents",
+    "voice"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
     "./package.json": "./package.json"
   },
-  "files": ["dist", "README.md", "LICENSE"],
-  "engines": { "node": ">=20" },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
