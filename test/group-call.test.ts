@@ -816,8 +816,28 @@ test("somebody in a room presses *, a number and #, and the app is asked to call
   for (const e of pressed("leg-1", "*4085550101#")) await party.handle(e);
   assert.deepEqual(invites, [{ code: "482917", leg: "leg-1", digits: "4085550101" }]);
   const said = calls.filter((c) => c.path === "/calls/leg-1/actions/speak").map((c) => c.body["payload"]);
-  assert.match(String(said.at(-2)), /enter their phone number/);
-  assert.equal(said.at(-1), "Calling them now.");
+  assert.deepEqual(said, ["To call someone in, enter their phone number, then press pound. Press star to cancel.", "Calling them now."]);
+});
+
+test("agent identity DTMF is consumed without speaking the call-in prompt", async () => {
+  const { calls, fetch } = recorder(conferenceReplies("conf-9"));
+  const party = new GroupCall({ apiKey: "KEY_test", publicKey: "", fetch, codeLength: 6, invitePromptDelayMs: 25, onInvite: (_code, _who, digits) => digits === "00428193" ? "" : "Unexpected number." });
+  await party.handle(keyed("leg-1", "482917"));
+  for (const e of pressed("leg-1", "*00428193#")) await party.handle(e);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(calls.some((c) => c.path === "/calls/leg-1/actions/speak"), false);
+});
+
+test("a caller who pauses after star still gets the delayed call-in instructions", async () => {
+  const { calls, fetch } = recorder(conferenceReplies("conf-9"));
+  const party = new GroupCall({ apiKey: "KEY_test", publicKey: "", fetch, codeLength: 6, invitePromptDelayMs: 10, onInvite: () => "Calling them now." });
+  await party.handle(keyed("leg-1", "482917"));
+  await party.handle(pressed("leg-1", "*")[0]!);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const said = calls.filter((c) => c.path === "/calls/leg-1/actions/speak").map((c) => c.body["payload"]);
+  assert.deepEqual(said, ["To call someone in, enter their phone number, then press pound. Press star to cancel."]);
+  for (const e of pressed("leg-1", "4085550101#")) await party.handle(e);
+  assert.equal(calls.filter((c) => c.path === "/calls/leg-1/actions/speak").at(-1)?.body["payload"], "Calling them now.");
 });
 
 test("star again calls it off, and a keying left too long starts over", async () => {
