@@ -1,6 +1,6 @@
 {
   "name": "@profullstack/group-call",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A group call on a phone number: dial in, key a room code, talk with everyone else who did, people and AI agents alike. Telnyx Call Control state machine extracted from nixamp's party line; the engine behind nixamp live joins and group.call.pit.world.",
   "license": "MIT",
   "type": "module",

@@ -242,6 +242,8 @@ export interface GroupCallOptions {
    * hook, keys pressed in a room are ignored.
    */
   onInvite?: (code: string, who: Participant, digits: string) => Promise<string> | string;
+  /** Delay before announcing call-in instructions, so agent identity DTMF can be recognized silently. */
+  invitePromptDelayMs?: number;
   /** A finished line somebody said in a room (needs `transcribe`). */
   onTranscript?: (code: string, who: Participant, text: string) => void;
   /** A room recording (see `record`) is saved on Telnyx and ready to download. */
@@ -374,7 +376,7 @@ export class GroupCall {
   /** Legs whose voice failed once, which hear the plain one from then on. */
   private readonly plainVoice = new Set<string>();
   /** Legs in a room partway through keying a number to call in (after *, before #). */
-  private readonly keying = new Map<string, { digits: string; at: number }>();
+  private readonly keying = new Map<string, { digits: string; at: number; promptTimer: ReturnType<typeof setTimeout> | null }>();
   /** Names promised for callers about to arrive from a number: agents announce themselves. */
   private readonly expected: { code: string; from: string; name: string; until: number }[] = [];
   private readonly key: ReturnType<typeof createPublicKey> | null;
@@ -589,7 +591,7 @@ export class GroupCall {
       this.pendingGather.delete(leg);
       this.asks.delete(leg);
       this.plainVoice.delete(leg);
-      this.keying.delete(leg);
+      this.clearKeying(leg);
       return;
     }
   }
@@ -612,19 +614,35 @@ export class GroupCall {
     const now = this.now();
     let keying = this.keying.get(leg);
     if (keying && now - keying.at > INVITE_KEYING_MS) {
-      this.keying.delete(leg);
+      this.clearKeying(leg);
       keying = undefined;
     }
     const tell = (text: string) => this.command(leg, "speak", { payload: text, ...this.voiceBody(leg) });
 
     if (!keying) {
       if (digit !== "*") return;
-      this.keying.set(leg, { digits: "", at: now });
-      await tell("To call someone in, enter their phone number, then press pound. Press star to cancel.");
+      keying = { digits: "", at: now, promptTimer: null };
+      this.keying.set(leg, keying);
+      const delay = Math.max(0, this.options.invitePromptDelayMs ?? 0);
+      const prompt = "To call someone in, enter their phone number, then press pound. Press star to cancel.";
+      if (delay === 0) {
+        await tell(prompt);
+      } else {
+        // Agent legs send *token# immediately. Waiting briefly keeps the
+        // call-in instructions from leaking into the conference while still
+        // giving a human caller the prompt if they pause after pressing star.
+        const pendingKeying = keying;
+        keying.promptTimer = setTimeout(() => {
+          if (this.keying.get(leg) !== pendingKeying || pendingKeying.digits) return;
+          pendingKeying.promptTimer = null;
+          void tell(prompt).catch((e) => this.options.onEvent?.(`  an in-call prompt failed: ${(e as Error).message}`));
+        }, delay);
+      }
       return;
     }
+    this.clearPromptTimer(keying);
     if (digit === "*") {
-      this.keying.delete(leg);
+      this.clearKeying(leg);
       await tell("Cancelled.");
       return;
     }
@@ -633,7 +651,7 @@ export class GroupCall {
       keying.at = now;
       return;
     }
-    this.keying.delete(leg);
+    this.clearKeying(leg);
     if (!keying.digits) {
       await tell("I did not get a number. Press star to try again.");
       return;
@@ -1044,6 +1062,7 @@ export class GroupCall {
 
   /** A leg that hung up or was dropped, wherever it was. */
   private release(leg: string): void {
+    this.clearKeying(leg);
     const code = this.legRoom.get(leg);
     this.legRoom.delete(leg);
     if (code === undefined) return;
@@ -1059,6 +1078,17 @@ export class GroupCall {
       this.rooms.delete(code);
       this.options.onEvent?.("  a room is empty.");
     }
+  }
+
+  private clearPromptTimer(keying: { promptTimer: ReturnType<typeof setTimeout> | null }): void {
+    if (keying.promptTimer !== null) clearTimeout(keying.promptTimer);
+    keying.promptTimer = null;
+  }
+
+  private clearKeying(leg: string): void {
+    const keying = this.keying.get(leg);
+    if (keying) this.clearPromptTimer(keying);
+    this.keying.delete(leg);
   }
 
   private info(room: Room): RoomInfo {
